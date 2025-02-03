@@ -1,188 +1,154 @@
 import os
-import tweepy
+import requests
 import schedule
 import time
-import random
 import threading
+import sqlite3
 from flask import Flask, jsonify
 import logging
 import sys
 import traceback
 import socket
+from requests_oauthlib import OAuth1
+import random
+import openai
 
-# Configure logging with more verbose output
+# Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler('bot.log')
     ]
 )
-
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
-# Also enable Flask's debug logging
-logging.getLogger('werkzeug').setLevel(logging.DEBUG)
+# Load API keys from environment variables
+API_KEY = os.getenv("TWITTER_API_KEY")
+API_SECRET = os.getenv("TWITTER_API_SECRET")
+ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
+ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
+BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+
+if not all([API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET, BEARER_TOKEN, OPENAI_API_KEY, ODDS_API_KEY]):
+    logger.error("Missing API credentials. Ensure they are set in the environment.")
+    sys.exit(1)
+
+openai.api_key = OPENAI_API_KEY
+
+# Initialize database
+def init_db():
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS tweets (id INTEGER PRIMARY KEY, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS mentions (id INTEGER PRIMARY KEY, mention_text TEXT, username TEXT, processed INTEGER DEFAULT 0, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 def is_port_in_use(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(('', port))
-            return False
-        except socket.error:
-            return True
+        return s.connect_ex(('localhost', port)) == 0
 
-print("\n=== Starting MAX Sports Bot ===\n")
+# Create a Flask app
+app = Flask(__name__)
 
-try:
-    # Create a Flask app
-    app = Flask(__name__)
-    print("Flask app created successfully")
-
-    # Twitter API keys directly in code
-    API_KEY = "2C5WR3QFMzqHQGYRNyOYb4rz7"
-    API_SECRET = "JxPUBl4Inovj6eo9WcjnxnZlOEYjyx6jVxISjyeGonO5k7sjux"
-    ACCESS_TOKEN = "1881434884427976705-Gje1mKZYjNFofMWdsXJNSB5BU2NYy4"
-    ACCESS_TOKEN_SECRET = "02uLEFgbNE69S5MKVQYFmRmcnZNk3O4nbkMeXDOn8RvSm"
-
-    print("Twitter API credentials loaded")
-
-    # Authenticate with Twitter
-    print("\nAuthenticating with Twitter...")
-    auth = tweepy.OAuth1UserHandler(API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET)
-    api = tweepy.API(auth=auth)
-    print("Twitter authentication successful!")
-
-except Exception as e:
-    print(f"\nERROR during initialization: {str(e)}")
-    print("\nTraceback:")
-    traceback.print_exc()
-    sys.exit(1)
-
-def post_tweet():
-    """Post a tweet with sports prediction"""
+def rate_limited_request(url):
     try:
-        print("\nGenerating new tweet...")
-        predictions = [
-            "The Lakers are favored to win against the Warriors tonight! Their strong defense and recent momentum give them the edge. 🏀",
-            "Expecting a high-scoring game between the Celtics and Nets! Both teams are on fire offensively. 🔥",
-            "The Bucks look unstoppable tonight against the Hawks. Their size advantage will be crucial. 💪",
-            "Close game expected between Heat and 76ers, but Miami's home court advantage could be the difference! 🌴",
-            "The Suns are set to shine against the Clippers tonight! Their backcourt is looking unstoppable. ☀️"
-        ]
-        
-        catchphrases = [
-            "The numbers don't lie! 📊",
-            "Let's break it down! 🎯",
-            "Game on! 🔥",
-            "Time to ball! 🏀",
-            "Watch this space! 👀",
-            "Trust the process! 💯",
-            "Let's get it! 🎮",
-            "Money time! 💰"
-        ]
-        
-        prediction = random.choice(predictions)
-        catchphrase = random.choice(catchphrases)
-        tweet = f"🚨 MAX's Game Prediction: {prediction}\n\n{catchphrase}\n#NBA #SportsBetting"
-        
-        print(f"\nPosting tweet: {tweet}")
-        api.update_status(tweet)
-        print("Tweet posted successfully!")
-        
-        return {"success": True, "tweet": tweet}
+        response = requests.get(url)
+        if response.status_code == 429:  # Rate limit exceeded
+            logger.warning("Rate limit hit. Waiting before retrying...")
+            time.sleep(60)
+            return rate_limited_request(url)
+        return response
     except Exception as e:
-        print(f"\nERROR posting tweet: {str(e)}")
-        traceback.print_exc()
+        logger.error(f"Error making request: {str(e)}")
+        return None
+
+def fetch_sports_predictions():
+    try:
+        sport_key = "soccer_epl"
+        url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?apiKey={ODDS_API_KEY}&regions=us&markets=h2h,spreads"
+        response = rate_limited_request(url)
+        
+        if response and response.status_code == 200:
+            data = response.json()
+            if not data:
+                return "No current sports data available."
+            
+            game = random.choice(data)
+            home_team = game["home_team"]
+            away_team = game["away_team"]
+            bookmaker = next((b for b in game["bookmakers"] if b["key"] == "fanduel"), game["bookmakers"][0])
+            odds = bookmaker["markets"][0]["outcomes"]
+            prediction = f"{home_team} vs {away_team} - Odds: {odds[0]['price']} for {odds[0]['name']}, {odds[1]['price']} for {odds[1]['name']}"
+            return prediction
+        else:
+            return "Unable to fetch sports predictions at the moment."
+    except Exception as e:
+        logger.error(f"Error fetching Odds API data: {str(e)}")
+        return "Error fetching live sports data."
+
+def post_tweet(reply_to=None, username=None, message=None):
+    try:
+        if not message:
+            message = fetch_sports_predictions()
+        
+        tweet_text = f"@{username} {message}" if username else message
+        
+        url = "https://api.twitter.com/2/tweets"
+        auth = OAuth1(API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET)
+        payload = {"text": tweet_text}
+        if reply_to:
+            payload["in_reply_to_status_id"] = reply_to
+        
+        response = requests.post(url, json=payload, auth=auth)
+        
+        if response.status_code == 201:
+            conn = sqlite3.connect("bot.db")
+            c = conn.cursor()
+            c.execute("INSERT INTO tweets (content) VALUES (?)", (tweet_text,))
+            conn.commit()
+            conn.close()
+            return {"success": True, "tweet": tweet_text}
+        else:
+            return {"success": False, "error": response.text}
+    except Exception as e:
         return {"success": False, "error": str(e)}
 
-# Flask routes with error handling
 @app.route("/")
 def home():
-    try:
-        print("\nHome route accessed")
-        return "MAX Sports Bot is running!"
-    except Exception as e:
-        print(f"\nERROR in home route: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+    return "MAX Sports Bot is running!"
 
 @app.route("/health")
 def health():
-    try:
-        print("\nHealth check requested")
-        return jsonify({
-            "status": "healthy",
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "twitter_api": "initialized" if api else "not initialized"
-        })
-    except Exception as e:
-        print(f"\nERROR in health check: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "healthy", "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")})
 
 @app.route("/trigger")
 def trigger_message():
-    """Manually trigger a tweet"""
-    try:
-        print("\nTrigger endpoint accessed - posting tweet...")
-        result = post_tweet()
-        print(f"Trigger result: {result}")
-        return jsonify(result)
-    except Exception as e:
-        print(f"\nERROR triggering message: {str(e)}")
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+    result = post_tweet()
+    return jsonify(result)
 
 def run_scheduler():
-    """Run the scheduler in a separate thread"""
     while True:
-        try:
-            scheduler.run_pending()
-            time.sleep(1)
-        except Exception as e:
-            print(f"\nERROR in scheduler: {str(e)}")
-            time.sleep(5)  # Wait before retrying
+        schedule.run_pending()
+        time.sleep(1)
 
 def start_scheduler():
-    """Start the scheduler in a separate thread"""
-    try:
-        scheduler_thread = threading.Thread(target=run_scheduler)
-        scheduler_thread.daemon = True
-        scheduler_thread.start()
-        print("Scheduler started successfully")
-    except Exception as e:
-        print(f"\nERROR starting scheduler: {str(e)}")
-        raise
+    scheduler_thread = threading.Thread(target=run_scheduler)
+    scheduler_thread.daemon = True
+    scheduler_thread.start()
+    logger.info("Scheduler started successfully")
 
-# Initialize scheduler
-scheduler = schedule.Scheduler()
+schedule.every().day.at("12:00").do(post_tweet)
+schedule.every(5).minutes.do(fetch_sports_predictions)
 
-# Run the Flask app
 if __name__ == "__main__":
-    try:
-        print("\nStarting Flask app...")
-        
-        # Try different ports if default is in use
-        port = int(os.getenv("PORT", 8080))
-        if is_port_in_use(port):
-            print(f"Port {port} is in use, trying port 5000")
-            port = 5000
-            if is_port_in_use(port):
-                print(f"Port {port} is in use, trying port 3000")
-                port = 3000
-        
-        print(f"\nUsing port: {port}")
-        
-        # Start scheduler before running the app
-        print("\nStarting scheduler...")
-        start_scheduler()
-        
-        # Run the Flask app with minimal settings first
-        print(f"\nStarting Flask app on port {port}...")
-        app.run(host="localhost", port=port, debug=True, use_reloader=False)
-    except Exception as e:
-        print(f"\nERROR starting application: {str(e)}")
-        print("\nTraceback:")
-        traceback.print_exc()
-        sys.exit(1)
+    logger.info("Starting Flask app...")
+    start_scheduler()
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
