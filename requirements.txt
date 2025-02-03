@@ -1,5 +1,7 @@
-tweepy
+Flask
 requests
 schedule
-Flask
+openai
+requests-oauthlib
 gunicorn
+python-dotenv
